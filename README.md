@@ -13,7 +13,9 @@ The original dataset included raw, inconsistently formatted, and text-heavy feat
 ## Files
 
 - `data_cleaning_engineering.qmd` — Main Quarto notebook for all cleaning, engineering, and visualization steps
-- `enrollment.xlsx` — Original dataset (exported from Slate)
+- `data_cleaning_engineering.html` -  Rendered HTML report (self-contained)
+- `enrollment.xlsx` — Original dataset 
+  
 ---
 
 ## Key Techniques
