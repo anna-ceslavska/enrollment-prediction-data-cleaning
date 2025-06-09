@@ -1,0 +1,242 @@
+---
+title: "LFC Enrollment Data Cleaning & Feature Engineering"
+author: "Anna Ceslavska"
+format:
+  html:
+    self-contained: true
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    theme: cosmo
+editor: visual
+---
+
+## Project Overview
+
+This project focuses on cleaning, engineering, and preparing a large real-world admissions dataset (18,000+ records, 34 features) for downstream exploratory data analysis (EDA) and machine learning workflows.
+
+The original data, exported from a college admissions SQL-based CRM (Slate), contained inconsistent formats, text-heavy fields, and numerous redundant or multicollinear features.
+
+## Data Cleaning
+
+This part of the project focuses on cleaning and transforming admissions data to make it suitable for further analysis. The dataset includes information on student applications, engagement, and decisions throughout the admissions process. By applying data wrangling techniques, features are clean and engineered to improve the usability and interpretability of the dataset.
+
+```{r, include=FALSE}
+library(conflicted)
+library(ggplot2)
+library(readxl)
+library(stringr)
+library(tidyverse)
+library(writexl)
+library(zipcodeR)
+library(here)
+library(janitor)
+
+file <- here("enrollment.xlsx")
+admits <- read_excel(file)
+```
+
+### **Step 1:** Standardizing Column Names
+
+To ensure consistency and easier code referencing, I used `janitor::clean_names()` to rename all variables to `snake_case` format.
+
+```{r}
+admits <- admits %>% clean_names()
+names(admits)
+```
+
+### Step 2: Consolidating Redundant or Text-Based Features
+
+To streamline the dataset, I eliminated irrelevant and redundant columns:
+
+-   **Dropped Columns**:
+
+    -   `Interactions - Comma Separated`: Removed due to its complex format.
+
+    -   Any column containing `"Timestamp"`: To exclude unnecessary date-time details.
+
+```{r}
+tidy_admits <- admits %>%
+  select(-matches("timestamp"),-interactions_comma_separated)
+```
+
+### **Handling Missing Values**
+
+To prepare the dataset for modeling, I addressed missing values across key features based on domain context and usability:
+
+-   Website and engagement metrics (e.g., `main_edu_duration`, `ping_total_duration_seconds`, `zeemee_engagement_score`) were missing due to lack of student interaction. In these cases, I imputed `NA` with `0`, assuming no activity occurred.
+-   Events and visit-related variables, such as `visited_campus` and `events_count`, were similarly set to `0` when missing, under the assumption that no events were attended.
+-   FAFSA submission date was converted into a binary variable: `1` if the date was present (FAFSA submitted) and `0` if missing.
+
+```{r}
+cols_to_replace <- c(
+  "visited_campus",
+  "main_edu_ping_by_url_total_duration_seconds",
+  "ping_total_duration_seconds",
+  "deliver_statistics_status_percentage",
+  "clicks_deliver_statistics_status_percentage",
+  "zee_mee_engagement_score",
+  "events_comma_separated"
+)
+
+for (col in cols_to_replace) {
+  tidy_admits[[col]][is.na(tidy_admits[[col]])] <- 0}
+
+tidy_admits$fafsa_received_date <- ifelse(is.na(tidy_admits$fafsa_received_date), 0, 1)
+tidy_admits$`fafsa_received_date`[!is.na(tidy_admits$`fafsa_received_date`)] <- 1
+```
+
+The `Round` column contained both the year and the admission period (e.g., "2025 Early Decision"). To enhance usability, I split it into:
+
+-   Year: Admission year.
+
+-   Period: Application round (e.g., "Early Decision", "Regular").
+
+```{r}
+tidy_admits <- tidy_admits %>%
+  separate(round, into = c("year", "period"), sep = " ", extra = "merge")
+```
+
+## **Feature Engineering**
+
+I created a new variable `our_visits` which identified whether Lake Forest College's counselors ever visited high school or college fair.
+
+```{r}
+# Identify whether a student attended an event related to the institution
+tidy_admits <- tidy_admits %>%
+  mutate(our_visits = ifelse(str_detect(events_comma_separated, "High School Visit:|College Fair:|Virtual High School Visit|Virtual College Fair|Transfer Fair:|HSV:"), 1, 0))
+```
+
+### **Geographic Calculation**
+
+I calculated the geographic distance between each applicant’s ZIP code and the college’s ZIP code (60045) to create a distance-based feature. I then engineered a new categorical variable to segment applicants by location, labeling them as international (0), domestic U.S. (1), or in-state (Illinois = 2) to support location-based analysis in enrollment prediction.
+
+```{r}
+# Calculate distance from the college (ZIP Code: 60045) to the applicant’s ZIP code
+tidy_admits <- tidy_admits %>% 
+  mutate(distance = zip_distance('60045', active_us_5_digit_zip_code))
+
+# Drop unnecessary ZIP-related columns from the distance calculation
+tidy_admits$distance <- tidy_admits$distance[, !(colnames(tidy_admits$distance) %in% c("zipcode_a", "zipcode_b"))]
+
+# Categorize students based on their geographic location
+tidy_admits$location <- ifelse(
+  tidy_admits$active_country != "United States", "international",
+  ifelse(tidy_admits$active_region == "IL", "IL", "domestic"))
+
+tidy_admits$location <- recode(tidy_admits$location,
+                                     "international" = 0,
+                                     "domestic" = 1,
+                                     "IL" = 2)
+
+```
+
+### Student Group Classification
+
+I created a new categorical feature `student_group` that segments applicants based on their participation in key programs and outreach initiatives (e.g., UWC, recruitment events, and Forester Scholars Weekend.
+
+```{r}
+# Categorize students into groups based on their participation in specific programs
+tidy_admits <- tidy_admits %>%
+  mutate(student_group = case_when(
+    grepl("Recruit", tags) & grepl("Forester Scholars Weekend", tags) ~ 6,
+    grepl("UWC", tags) & grepl("Forester Scholars Weekend", tags) ~ 5,
+    grepl("UWC", tags) & grepl("Recruit", tags) ~ 4,
+    grepl("Forester Scholars Weekend", tags) ~ 3,
+    grepl("UWC", tags) ~ 1,
+    grepl("Recruit", tags) ~ 2,
+    TRUE ~ 0
+  ))
+```
+
+### **Ensuring Numeric Data for Analysis**
+
+Some engagement and performance metrics were stored as text. I converted them into numeric values to enable proper calculations and visualizations.
+
+```{r}
+num_cols <- c(
+  "zee_mee_engagement_score",
+  "deliver_statistics_status_percentage",
+  "clicks_deliver_statistics_status_percentage"
+)
+
+tidy_admits[num_cols] <- lapply(tidy_admits[num_cols], as.numeric)
+
+```
+
+### Extract Last Decision & Identify Enrolling Students
+
+I extracted the final admission decision from each applicant’s decision history by parsing the comma-separated decision log and selecting the most recent entry. Based on this, I engineered a binary target variable `enrolling_stage` that indicates whether the student ultimately paid a deposit and enrolled (`1`) or not (`0`). This served as the outcome variable for the classification model.
+
+```{r}
+last_decision <- sapply(strsplit(tidy_admits$decision_history_all_decisions, ",\\s*"), tail, n = 1)
+
+tidy_admits$enrolling_stage <- ifelse(last_decision == "Deposit Paid (Enroll)", 1, 0)
+```
+
+```{r}
+tidy_admits$enrolling_stage <- as.numeric(tidy_admits$enrolling_stage)
+```
+
+I visualized the distribution of enrollment outcomes using a bar chart that compares the number of students who enrolled versus those who didn’t.
+
+```{r}
+ggplot(tidy_admits, aes(x = factor(enrolling_stage, labels = c("Didn't Enroll", "Enrolled")),
+                        fill = factor(enrolling_stage, labels = c("No", "Yes")))) +
+ geom_bar(width = 0.4) +
+  scale_fill_brewer(palette = "Dark2") +
+  labs(x = "Erollment Status",
+       y = "Students Count",
+       title = "Distribution of Students Enrollment",
+       fill = "Enrolled?") +
+  theme_minimal()
+```
+
+## Dropping Variables
+
+In preparing the dataset for correlation analysis and modeling, I removed or consolidated several variables based on domain relevance and discussions with the admissions team:
+
+-   **Geographic Variables:**\
+    Variables such as `active_region`, `active_country`, and other text-based geographic features were replaced with two derived metrics: `location` (in-state/out-of-state) and `distance` (miles from campus based on ZIP code). These numeric representations are more informative and compatible with correlation analysis.
+
+-   **Tags:**\
+    The `tags` column was often inconsistently used. It was replaced with a more structured variable, `student_group`, which captures group type in a cleaner, categorical format.
+
+-   **Campus Visit Indicator:**\
+    The `visited_campus` column was removed after clarification from the admissions team that this is simply one of many student events. Instead, `events_count` already captures this in aggregate.
+
+-   **Comma-Separated Event List:**\
+    The `events` column containing comma-separated event names was dropped in favor of `events_count`, which is a more quantitative and modeling-friendly metric.
+
+-   **Admit and Deposit Dates:**\
+    Columns like `admit_date` and `deposit_date` were removed due to technical limitations and lack of consistency. These dates are also not directly used in predicting student decisions.
+
+This refinement ensures that the remaining variables are clean, relevant, and ready for statistical analysis and machine learning workflows.
+
+```{r}
+tidy_admits <- tidy_admits %>%
+  select(
+    -"active_region",          # Replaced by 'location' and 'distance'
+    -"active_country",         # Same as above
+    -"active_city",            # Optional: drop if not being used
+    -"tags",                   # Replaced with 'student_group'
+    -"visited_campus",      # Redundant with 'eventsCount'
+    -"events_comma_separated",                 # Comma-separated list not used
+    -"admit_date",             # Dropped due to tech constraints
+    -"deposit_date",            # Dropped due to tech constraints
+    -"decision_history_all_decisions",
+    -"active_us_5_digit_zip_code",
+    -"fafsa_received_date"
+  )
+```
+
+### Dataset Preview & Summary
+
+```{r}
+library(skimr)
+skim(tidy_admits)
+```
+
+## Conclusion
+
+The dataset has been thoroughly cleaned and enriched to prepare it for downstream analysis. Key transformations include the standardization of missing values, derivation of institutional engagement indicators, and the calculation of geographic distance from campus. This structured dataset is now ready to be used in predictive modeling to estimate the likelihood of student enrollment.
